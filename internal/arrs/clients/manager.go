@@ -7,6 +7,7 @@ import (
 
 	"github.com/javi11/altmount/internal/arrs/model"
 	"golift.io/starr"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
 )
@@ -15,12 +16,14 @@ type Manager struct {
 	mu            sync.RWMutex
 	radarrClients map[string]*radarr.Radarr // key: instance name
 	sonarrClients map[string]*sonarr.Sonarr // key: instance name
+	lidarrClients map[string]*lidarr.Lidarr // key: instance name
 }
 
 func NewManager() *Manager {
 	return &Manager{
 		radarrClients: make(map[string]*radarr.Radarr),
 		sonarrClients: make(map[string]*sonarr.Sonarr),
+		lidarrClients: make(map[string]*lidarr.Lidarr),
 	}
 }
 
@@ -52,12 +55,30 @@ func (m *Manager) GetOrCreateSonarrClient(instanceName, url, apiKey string) (*so
 	return client, nil
 }
 
+// GetOrCreateLidarrClient gets or creates a Lidarr client for an instance
+func (m *Manager) GetOrCreateLidarrClient(instanceName, url, apiKey string) (*lidarr.Lidarr, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if client, exists := m.lidarrClients[instanceName]; exists {
+		return client, nil
+	}
+
+	client := lidarr.New(&starr.Config{URL: url, APIKey: apiKey})
+	m.lidarrClients[instanceName] = client
+	return client, nil
+}
+
 // GetOrCreateClient is a helper to get or create the appropriate client
 func (m *Manager) GetOrCreateClient(instance *model.ConfigInstance) (any, error) {
-	if instance.Type == "radarr" {
+	switch instance.Type {
+	case "radarr":
 		return m.GetOrCreateRadarrClient(instance.Name, instance.URL, instance.APIKey)
+	case "lidarr":
+		return m.GetOrCreateLidarrClient(instance.Name, instance.URL, instance.APIKey)
+	default:
+		return m.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
 	}
-	return m.GetOrCreateSonarrClient(instance.Name, instance.URL, instance.APIKey)
 }
 
 // TestConnection tests the connection to an arrs instance
@@ -76,6 +97,14 @@ func (m *Manager) TestConnection(ctx context.Context, instanceType, url, apiKey 
 		_, err := client.GetSystemStatus()
 		if err != nil {
 			return fmt.Errorf("failed to connect to Sonarr: %w", err)
+		}
+		return nil
+
+	case "lidarr":
+		client := lidarr.New(&starr.Config{URL: url, APIKey: apiKey})
+		_, err := client.GetSystemStatusContext(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to connect to Lidarr: %w", err)
 		}
 		return nil
 

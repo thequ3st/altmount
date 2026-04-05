@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
 )
@@ -20,6 +21,7 @@ type Manager struct {
 	movieCache        map[string][]*radarr.Movie       // key: instance name
 	seriesCache       map[string][]*sonarr.Series      // key: instance name
 	episodeFilesCache map[string][]*sonarr.EpisodeFile // key: instance name + series id
+	artistCache       map[string][]*lidarr.Artist      // key: instance name
 	cacheExpiry       map[string]time.Time             // key: cache key
 	requestGroup      singleflight.Group
 }
@@ -29,6 +31,7 @@ func NewManager() *Manager {
 		movieCache:        make(map[string][]*radarr.Movie),
 		seriesCache:       make(map[string][]*sonarr.Series),
 		episodeFilesCache: make(map[string][]*sonarr.EpisodeFile),
+		artistCache:       make(map[string][]*lidarr.Artist),
 		cacheExpiry:       make(map[string]time.Time),
 	}
 }
@@ -172,6 +175,52 @@ func (m *Manager) GetEpisodeFiles(ctx context.Context, client *sonarr.Sonarr, in
 	return v.([]*sonarr.EpisodeFile), nil
 }
 
+// GetArtists retrieves all artists from Lidarr, using a cache if available and valid
+func (m *Manager) GetArtists(ctx context.Context, client *lidarr.Lidarr, instanceName string) ([]*lidarr.Artist, error) {
+	// 1. Check cache (read lock)
+	m.cacheMu.RLock()
+	artists, ok := m.artistCache[instanceName]
+	expiry, valid := m.cacheExpiry["lidarr_artists_"+instanceName]
+	m.cacheMu.RUnlock()
+
+	if ok && valid && time.Now().Before(expiry) {
+		slog.DebugContext(ctx, "Using cached artist list", "instance", instanceName, "count", len(artists))
+		return artists, nil
+	}
+
+	// 2. Use singleflight to deduplicate requests
+	key := "lidarr_artists_" + instanceName
+	v, err, _ := m.requestGroup.Do(key, func() (any, error) {
+		// Double check cache
+		m.cacheMu.RLock()
+		artists, ok := m.artistCache[instanceName]
+		expiry, valid := m.cacheExpiry[key]
+		m.cacheMu.RUnlock()
+		if ok && valid && time.Now().Before(expiry) {
+			return artists, nil
+		}
+
+		slog.DebugContext(ctx, "Fetching fresh artist list", "instance", instanceName)
+		freshArtists, err := client.GetArtistContext(ctx, "")
+		if err != nil {
+			return nil, err
+		}
+
+		m.cacheMu.Lock()
+		m.artistCache[instanceName] = freshArtists
+		m.cacheExpiry[key] = time.Now().Add(cacheTTL)
+		m.cacheMu.Unlock()
+
+		return freshArtists, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return v.([]*lidarr.Artist), nil
+}
+
 // ClearMoviesCache clears the movies cache for a specific instance
 func (m *Manager) ClearMoviesCache(instanceName string) {
 	m.cacheMu.Lock()
@@ -195,4 +244,12 @@ func (m *Manager) ClearSeriesCache(instanceName string) {
 			delete(m.cacheExpiry, key)
 		}
 	}
+}
+
+// ClearArtistsCache clears the artists cache for a specific instance
+func (m *Manager) ClearArtistsCache(instanceName string) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	delete(m.artistCache, instanceName)
+	delete(m.cacheExpiry, "lidarr_artists_"+instanceName)
 }

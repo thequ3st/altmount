@@ -245,6 +245,19 @@ func (s *Service) GetHealth(ctx context.Context) (map[string]any, error) {
 				continue
 			}
 			results[instance.Name] = health
+
+		case "lidarr":
+			client, err := s.clients.GetOrCreateLidarrClient(instance.Name, instance.URL, instance.APIKey)
+			if err != nil {
+				slog.ErrorContext(ctx, "Failed to create Lidarr client for health check", "instance", instance.Name, "error", err)
+				continue
+			}
+			err = client.GetInto(ctx, starr.Request{URI: "/health"}, &health)
+			if err != nil {
+				slog.ErrorContext(ctx, "Failed to get Lidarr health", "instance", instance.Name, "error", err)
+				continue
+			}
+			results[instance.Name] = health
 		}
 	}
 

@@ -10,6 +10,7 @@ import (
 	"github.com/javi11/altmount/internal/arrs/model"
 	"github.com/javi11/altmount/internal/config"
 	"golift.io/starr"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
 )
@@ -56,6 +57,21 @@ func (m *Manager) GetAllInstances() []*model.ConfigInstance {
 				APIKey:   sonarrConfig.APIKey,
 				Category: sonarrConfig.Category,
 				Enabled:  sonarrConfig.Enabled != nil && *sonarrConfig.Enabled,
+			}
+			instances = append(instances, instance)
+		}
+	}
+
+	// Convert Lidarr instances
+	if len(cfg.Arrs.LidarrInstances) > 0 {
+		for _, lidarrConfig := range cfg.Arrs.LidarrInstances {
+			instance := &model.ConfigInstance{
+				Name:     lidarrConfig.Name,
+				Type:     "lidarr",
+				URL:      lidarrConfig.URL,
+				APIKey:   lidarrConfig.APIKey,
+				Category: lidarrConfig.Category,
+				Enabled:  lidarrConfig.Enabled != nil && *lidarrConfig.Enabled,
 			}
 			instances = append(instances, instance)
 		}
@@ -113,6 +129,8 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 		category = "movies"
 	case "sonarr":
 		category = "tv"
+	case "lidarr":
+		category = "music"
 	default:
 		return false, fmt.Errorf("unsupported ARR type: %s", arrType)
 	}
@@ -154,6 +172,8 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 		newConfig.Arrs.RadarrInstances = append(newConfig.Arrs.RadarrInstances, newInstance)
 	case "sonarr":
 		newConfig.Arrs.SonarrInstances = append(newConfig.Arrs.SonarrInstances, newInstance)
+	case "lidarr":
+		newConfig.Arrs.LidarrInstances = append(newConfig.Arrs.LidarrInstances, newInstance)
 	}
 
 	// Create category for this ARR type
@@ -192,6 +212,9 @@ func (m *Manager) detectARRType(ctx context.Context, arrURL, apiKey string) (str
 		case "Sonarr":
 			slog.DebugContext(ctx, "Detected Sonarr instance", "url", arrURL)
 			return "sonarr", nil
+		case "Lidarr":
+			slog.DebugContext(ctx, "Detected Lidarr instance", "url", arrURL)
+			return "lidarr", nil
 		default:
 			slog.DebugContext(ctx, "Unknown AppName from Radarr client", "app_name", radarrStatus.AppName, "url", arrURL)
 		}
@@ -208,12 +231,34 @@ func (m *Manager) detectARRType(ctx context.Context, arrURL, apiKey string) (str
 		case "Sonarr":
 			slog.DebugContext(ctx, "Detected Sonarr instance", "url", arrURL)
 			return "sonarr", nil
+		case "Lidarr":
+			slog.DebugContext(ctx, "Detected Lidarr instance", "url", arrURL)
+			return "lidarr", nil
 		default:
 			slog.DebugContext(ctx, "Unknown AppName from Sonarr client", "app_name", sonarrStatus.AppName, "url", arrURL)
 		}
 	}
 
-	return "", fmt.Errorf("unable to detect ARR type for URL %s - neither Radarr nor Sonarr responded successfully", arrURL)
+	// Try Lidarr
+	lidarrClient := lidarr.New(&starr.Config{URL: arrURL, APIKey: apiKey})
+	lidarrStatus, err := lidarrClient.GetSystemStatusContext(ctx)
+	if err == nil {
+		switch lidarrStatus.AppName {
+		case "Radarr":
+			slog.DebugContext(ctx, "Detected Radarr instance", "url", arrURL)
+			return "radarr", nil
+		case "Sonarr":
+			slog.DebugContext(ctx, "Detected Sonarr instance", "url", arrURL)
+			return "sonarr", nil
+		case "Lidarr":
+			slog.DebugContext(ctx, "Detected Lidarr instance", "url", arrURL)
+			return "lidarr", nil
+		default:
+			slog.DebugContext(ctx, "Unknown AppName from Lidarr client", "app_name", lidarrStatus.AppName, "url", arrURL)
+		}
+	}
+
+	return "", fmt.Errorf("unable to detect ARR type for URL %s - neither Radarr, Sonarr, nor Lidarr responded successfully", arrURL)
 }
 
 // generateInstanceName generates an instance name from a URL
@@ -266,15 +311,20 @@ func (m *Manager) categoryUsedByOtherInstance(arrType, category string) bool {
 		instances = cfg.Arrs.RadarrInstances
 	case "sonarr":
 		instances = cfg.Arrs.SonarrInstances
+	case "lidarr":
+		instances = cfg.Arrs.LidarrInstances
 	}
 
 	for _, instance := range instances {
 		instanceCat := instance.Category
 		if instanceCat == "" {
-			if arrType == "radarr" {
+			switch arrType {
+			case "radarr":
 				instanceCat = "movies"
-			} else {
+			case "sonarr":
 				instanceCat = "tv"
+			case "lidarr":
+				instanceCat = "music"
 			}
 		}
 

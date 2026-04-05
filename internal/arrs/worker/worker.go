@@ -160,6 +160,11 @@ func (w *Worker) CleanupQueue(ctx context.Context) error {
 				slog.WarnContext(ctx, "Failed to cleanup Sonarr queue",
 					"instance", instance.Name, "error", err)
 			}
+		case "lidarr":
+			if err := w.cleanupLidarrQueue(ctx, instance, cfg); err != nil {
+				slog.WarnContext(ctx, "Failed to cleanup Lidarr queue",
+					"instance", instance.Name, "error", err)
+			}
 		}
 	}
 
@@ -405,6 +410,128 @@ func (w *Worker) cleanupSonarrQueue(ctx context.Context, instance *model.ConfigI
 			}
 		}
 		slog.InfoContext(ctx, "Cleaned up Sonarr queue items",
+			"instance", instance.Name, "count", len(idsToRemove))
+	}
+	return nil
+}
+
+func (w *Worker) cleanupLidarrQueue(ctx context.Context, instance *model.ConfigInstance, cfg *config.Config) error {
+	client, err := w.clients.GetOrCreateLidarrClient(instance.Name, instance.URL, instance.APIKey)
+	if err != nil {
+		return fmt.Errorf("failed to get Lidarr client: %w", err)
+	}
+
+	queue, err := client.GetQueueContext(ctx, 0, 500)
+	if err != nil {
+		return fmt.Errorf("failed to get Lidarr queue: %w", err)
+	}
+
+	var idsToRemove []int64
+	for _, q := range queue.Records {
+		// Strategy 1: Ghost detection -- cleanup already-imported files
+		if w.checkGhostByImportHistory(ctx, q.OutputPath, cfg, instance.Name, q.Title) {
+			idsToRemove = append(idsToRemove, q.ID)
+			continue
+		}
+
+		// Fallback: path-gone check with safety guards
+		if w.isGhostByPathGone(ctx, q.OutputPath, q.ID, cfg, instance.Name, q.Title) {
+			idsToRemove = append(idsToRemove, q.ID)
+			continue
+		}
+
+		// Strategy 2: Graceful cleanup for blocked/failed imports
+		// Lidarr QueueRecord does not have TrackedDownloadState; check status and trackedDownloadStatus only
+		if q.Status != "completed" || q.TrackedDownloadStatus != "warning" {
+			continue
+		}
+
+		// Check if path is within managed directories (import_dir, mount_path, or complete_dir)
+		if !w.isPathManaged(q.OutputPath, cfg) {
+			continue
+		}
+
+		// Check status messages for known issues
+		shouldCleanup := false
+		for _, msg := range q.StatusMessages {
+			allMessages := strings.Join(msg.Messages, " ")
+
+			// Automatic import failure cleanup (configurable)
+			if cfg.Arrs.CleanupAutomaticImportFailure != nil && *cfg.Arrs.CleanupAutomaticImportFailure &&
+				strings.Contains(allMessages, "Automatic import is not possible") {
+				shouldCleanup = true
+				break
+			}
+
+			// Check configured allowlist
+			for _, allowedMsg := range cfg.Arrs.QueueCleanupAllowlist {
+				if allowedMsg.Enabled && (strings.Contains(allMessages, allowedMsg.Message) || strings.Contains(msg.Title, allowedMsg.Message)) {
+					shouldCleanup = true
+					break
+				}
+			}
+
+			if shouldCleanup {
+				break
+			}
+		}
+
+		if shouldCleanup {
+			key := fmt.Sprintf("%s|%d", instance.Name, q.ID)
+			w.firstSeenMu.Lock()
+			seenTime, exists := w.firstSeen[key]
+			if !exists {
+				w.firstSeen[key] = time.Now()
+				w.firstSeenMu.Unlock()
+				slog.DebugContext(ctx, "First saw failed import pending item, starting grace period",
+					"path", q.OutputPath, "title", q.Title, "instance", instance.Name)
+				continue
+			}
+			w.firstSeenMu.Unlock()
+
+			gracePeriod := time.Duration(cfg.Arrs.QueueCleanupGracePeriodMinutes) * time.Minute
+			if time.Since(seenTime) < gracePeriod {
+				slog.DebugContext(ctx, "Item still in grace period",
+					"path", q.OutputPath, "title", q.Title, "instance", instance.Name,
+					"remaining", gracePeriod-time.Since(seenTime))
+				continue
+			}
+
+			slog.InfoContext(ctx, "Found failed import pending item after grace period",
+				"path", q.OutputPath, "title", q.Title, "instance", instance.Name)
+			idsToRemove = append(idsToRemove, q.ID)
+
+			w.firstSeenMu.Lock()
+			delete(w.firstSeen, key)
+			w.firstSeenMu.Unlock()
+		} else {
+			// If it's no longer matching failure criteria, remove from tracking
+			key := fmt.Sprintf("%s|%d", instance.Name, q.ID)
+			w.firstSeenMu.Lock()
+			delete(w.firstSeen, key)
+			w.firstSeenMu.Unlock()
+		}
+	}
+
+	// Remove from ARR queue with removeFromClient and blocklist flags
+	if len(idsToRemove) > 0 {
+		removeFromClient := true
+		opts := &starr.QueueDeleteOpts{
+			RemoveFromClient: &removeFromClient,
+			BlockList:        false,
+			SkipRedownload:   false,
+		}
+		for _, id := range idsToRemove {
+			if err := client.DeleteQueueContext(ctx, id, opts); err != nil {
+				if strings.Contains(err.Error(), "404") {
+					slog.DebugContext(ctx, "Queue item already removed from Lidarr", "id", id)
+				} else {
+					slog.ErrorContext(ctx, "Failed to delete queue item",
+						"id", id, "error", err)
+				}
+			}
+		}
+		slog.InfoContext(ctx, "Cleaned up Lidarr queue items",
 			"instance", instance.Name, "count", len(idsToRemove))
 	}
 	return nil

@@ -200,6 +200,7 @@ arrs:
   max_workers: 5 # Number of concurrent workers (default: 5)
   radarr_instances: [] # Radarr instances (configured via UI)
   sonarr_instances: [] # Sonarr instances (configured via UI)
+  lidarr_instances: [] # Lidarr instances (configured via UI)
   # Queue Cleanup Configuration
   queue_cleanup_enabled: true # Enable automatic queue cleanup for failed imports (default: true)
   queue_cleanup_interval_seconds: 10 # Interval in seconds to check for failed imports (default: 10)

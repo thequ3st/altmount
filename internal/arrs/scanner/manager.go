@@ -16,6 +16,7 @@ import (
 	"github.com/javi11/altmount/internal/arrs/model"
 	"github.com/javi11/altmount/internal/config"
 	"golift.io/starr"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
 )
@@ -109,33 +110,51 @@ func (m *Manager) findInstanceForFilePath(ctx context.Context, filePath string, 
 }
 
 func (m *Manager) managesFile(ctx context.Context, instanceType string, client any, filePath string) bool {
-	if instanceType == "radarr" {
+	switch instanceType {
+	case "radarr":
 		rc, ok := client.(*radarr.Radarr)
 		if !ok {
 			return false
 		}
 		return m.radarrManagesFile(ctx, rc, filePath)
-	}
-	sc, ok := client.(*sonarr.Sonarr)
-	if !ok {
+	case "sonarr":
+		sc, ok := client.(*sonarr.Sonarr)
+		if !ok {
+			return false
+		}
+		return m.sonarrManagesFile(ctx, sc, filePath)
+	case "lidarr":
+		lc, ok := client.(*lidarr.Lidarr)
+		if !ok {
+			return false
+		}
+		return m.lidarrManagesFile(ctx, lc, filePath)
+	default:
 		return false
 	}
-	return m.sonarrManagesFile(ctx, sc, filePath)
 }
 
 func (m *Manager) hasFile(ctx context.Context, instanceType string, client any, instanceName, relativePath string) bool {
-	if instanceType == "radarr" {
+	switch instanceType {
+	case "radarr":
 		rc, ok := client.(*radarr.Radarr)
 		if !ok {
 			return false
 		}
 		return m.radarrHasFile(ctx, rc, instanceName, relativePath)
-	}
-	sc, ok := client.(*sonarr.Sonarr)
-	if !ok {
+	case "sonarr":
+		sc, ok := client.(*sonarr.Sonarr)
+		if !ok {
+			return false
+		}
+		return m.sonarrHasFile(ctx, sc, instanceName, relativePath)
+	case "lidarr":
+		// Lidarr file matching is complex (albums/tracks); rely on category-based
+		// and downloadId matching instead of file-path matching
+		return false
+	default:
 		return false
 	}
-	return m.sonarrHasFile(ctx, sc, instanceName, relativePath)
 }
 
 // radarrManagesFile checks if Radarr manages the given file path using root folders (checkrr approach)
@@ -186,6 +205,31 @@ func (m *Manager) sonarrManagesFile(ctx context.Context, client *sonarr.Sonarr, 
 	}
 
 	slog.DebugContext(ctx, "File does not match any Sonarr root folders")
+	return false
+}
+
+// lidarrManagesFile checks if Lidarr manages the given file path using root folders
+func (m *Manager) lidarrManagesFile(ctx context.Context, client *lidarr.Lidarr, filePath string) bool {
+	slog.DebugContext(ctx, "Checking Lidarr root folders for file ownership",
+		"file_path", filePath)
+
+	// Get root folders from Lidarr (much faster than GetArtist)
+	rootFolders, err := client.GetRootFoldersContext(ctx)
+	if err != nil {
+		slog.DebugContext(ctx, "Failed to get root folders from Lidarr for file check", "error", err)
+		return false
+	}
+
+	// Check if file path starts with any root folder path
+	for _, folder := range rootFolders {
+		slog.DebugContext(ctx, "Checking Lidarr root folder", "folder_path", folder.Path, "file_path", filePath)
+		if strings.HasPrefix(filePath, folder.Path) {
+			slog.DebugContext(ctx, "File matches Lidarr root folder", "folder_path", folder.Path)
+			return true
+		}
+	}
+
+	slog.DebugContext(ctx, "File does not match any Lidarr root folders")
 	return false
 }
 
@@ -270,6 +314,13 @@ func (m *Manager) TriggerFileRescan(ctx context.Context, pathForRescan string, r
 			}
 			return nil, m.triggerSonarrRescanByPath(ctx, client, pathForRescan, relativePath, instanceName)
 
+		case "lidarr":
+			client, err := m.clients.GetOrCreateLidarrClient(instanceName, instanceConfig.URL, instanceConfig.APIKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create Lidarr client: %w", err)
+			}
+			return nil, m.triggerLidarrRescanByPath(ctx, client, pathForRescan, instanceName)
+
 		default:
 			return nil, fmt.Errorf("unsupported instance type: %s", instanceType)
 		}
@@ -336,6 +387,20 @@ func (m *Manager) TriggerScanForFile(ctx context.Context, filePath string) error
 			} else {
 				slog.InfoContext(bgCtx, "Triggered RefreshMonitoredDownloads", "instance", instance.Name)
 			}
+
+		case "lidarr":
+			client, err := m.clients.GetOrCreateLidarrClient(instance.Name, instance.URL, instance.APIKey)
+			if err != nil {
+				slog.ErrorContext(bgCtx, "Failed to create Lidarr client for scan trigger", "instance", instance.Name, "error", err)
+				return
+			}
+			// Trigger RefreshMonitoredDownloads
+			_, err = client.SendCommandContext(bgCtx, &lidarr.CommandRequest{Name: "RefreshMonitoredDownloads"})
+			if err != nil {
+				slog.ErrorContext(bgCtx, "Failed to trigger RefreshMonitoredDownloads", "instance", instance.Name, "error", err)
+			} else {
+				slog.InfoContext(bgCtx, "Triggered RefreshMonitoredDownloads", "instance", instance.Name)
+			}
 		}
 	}()
 
@@ -380,6 +445,20 @@ func (m *Manager) TriggerDownloadScan(ctx context.Context, instanceType string) 
 					}
 					// Trigger RefreshMonitoredDownloads
 					_, err = client.SendCommandContext(bgCtx, &sonarr.CommandRequest{Name: "RefreshMonitoredDownloads"})
+					if err != nil {
+						slog.ErrorContext(bgCtx, "Failed to trigger RefreshMonitoredDownloads", "instance", inst.Name, "error", err)
+					} else {
+						slog.InfoContext(bgCtx, "Triggered RefreshMonitoredDownloads", "instance", inst.Name)
+					}
+
+				case "lidarr":
+					client, err := m.clients.GetOrCreateLidarrClient(inst.Name, inst.URL, inst.APIKey)
+					if err != nil {
+						slog.ErrorContext(bgCtx, "Failed to create Lidarr client for scan trigger", "instance", inst.Name, "error", err)
+						return nil, err
+					}
+					// Trigger RefreshMonitoredDownloads
+					_, err = client.SendCommandContext(bgCtx, &lidarr.CommandRequest{Name: "RefreshMonitoredDownloads"})
 					if err != nil {
 						slog.ErrorContext(bgCtx, "Failed to trigger RefreshMonitoredDownloads", "instance", inst.Name, "error", err)
 					} else {
@@ -831,4 +910,107 @@ func (m *Manager) blocklistSonarrEpisodeFile(ctx context.Context, client *sonarr
 
 	slog.WarnContext(ctx, "Could not find grab event in Sonarr history for download", "download_id", downloadID)
 	return nil
+}
+
+// triggerLidarrRescanByPath triggers a rescan in Lidarr for the given file path.
+// Since Lidarr's library structure (artists/albums/tracks) is more complex,
+// we use a RefreshArtist approach: find the artist whose path contains the file,
+// then trigger a search for that artist.
+func (m *Manager) triggerLidarrRescanByPath(ctx context.Context, client *lidarr.Lidarr, filePath, instanceName string) error {
+	slog.InfoContext(ctx, "Searching Lidarr for matching artist",
+		"instance", instanceName,
+		"file_path", filePath)
+
+	// Get all artists to find the one that contains this file path
+	artists, err := m.data.GetArtists(ctx, client, instanceName)
+	if err != nil {
+		return fmt.Errorf("failed to get artists from Lidarr: %w", err)
+	}
+
+	var targetArtist *lidarr.Artist
+	for _, artist := range artists {
+		if strings.Contains(filePath, artist.Path) {
+			targetArtist = artist
+			break
+		}
+	}
+
+	if targetArtist == nil {
+		// Try folder name matching as fallback
+		for _, artist := range artists {
+			artistFolderName := filepath.Base(artist.Path)
+			if strings.Contains(filePath, artistFolderName) {
+				slog.InfoContext(ctx, "Found Lidarr artist match by folder name",
+					"artist", artist.ArtistName, "folder", artistFolderName)
+				targetArtist = artist
+				break
+			}
+		}
+	}
+
+	if targetArtist == nil {
+		slog.WarnContext(ctx, "No artist found in Lidarr matching file path, attempting queue-based failure",
+			"instance", instanceName,
+			"file_path", filePath)
+
+		// Fallback: search in Lidarr download queue for active/stuck imports
+		if err := m.failLidarrQueueItemByPath(ctx, client, filePath); err == nil {
+			return nil
+		}
+
+		return fmt.Errorf("no artist found containing file path in library or queue: %s: %w", filePath, model.ErrPathMatchFailed)
+	}
+
+	slog.InfoContext(ctx, "Found matching artist, triggering refresh",
+		"instance", instanceName,
+		"artist_id", targetArtist.ID,
+		"artist_name", targetArtist.ArtistName,
+		"artist_path", targetArtist.Path)
+
+	// Trigger a RefreshArtist command to rescan the artist
+	refreshCmd := &lidarr.CommandRequest{
+		Name:     "RefreshArtist",
+		ArtistID: targetArtist.ID,
+	}
+
+	response, err := client.SendCommandContext(ctx, refreshCmd)
+	if err != nil {
+		return fmt.Errorf("failed to trigger Lidarr RefreshArtist for artist ID %d: %w", targetArtist.ID, err)
+	}
+
+	slog.InfoContext(ctx, "Successfully triggered Lidarr RefreshArtist",
+		"instance", instanceName,
+		"artist_id", targetArtist.ID,
+		"artist_name", targetArtist.ArtistName,
+		"command_id", response.ID)
+
+	return nil
+}
+
+// failLidarrQueueItemByPath searches for an item in the active Lidarr queue by path and marks it as failed
+func (m *Manager) failLidarrQueueItemByPath(ctx context.Context, client *lidarr.Lidarr, path string) error {
+	queue, err := client.GetQueueContext(ctx, 0, 500)
+	if err != nil {
+		return fmt.Errorf("failed to get Lidarr queue: %w", err)
+	}
+
+	for _, q := range queue.Records {
+		// Try exact match, suffix match, or filename match
+		if q.OutputPath == path ||
+			(q.OutputPath != "" && strings.HasSuffix(filepath.ToSlash(path), filepath.ToSlash(q.OutputPath))) ||
+			(q.OutputPath != "" && filepath.Base(q.OutputPath) == filepath.Base(path)) {
+			slog.InfoContext(ctx, "Found matching item in Lidarr download queue, marking as failed",
+				"queue_id", q.ID, "path", path, "output_path", q.OutputPath)
+
+			removeFromClient := true
+			opts := &starr.QueueDeleteOpts{
+				RemoveFromClient: &removeFromClient,
+				BlockList:        true,
+				SkipRedownload:   false,
+			}
+			return client.DeleteQueueContext(ctx, q.ID, opts)
+		}
+	}
+
+	return fmt.Errorf("no matching item found in Lidarr queue for path: %s", path)
 }
