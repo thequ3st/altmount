@@ -244,8 +244,6 @@ func (m *Manager) EnsureWebhookRegistration(ctx context.Context, altmountURL str
 						OnUpgrade:          true,
 						OnRename:           true,
 						OnTrackRetag:       true,
-						OnAlbumDelete:      true,
-						OnArtistDelete:     true,
 						Fields: []*starr.FieldInput{
 							{Name: "url", Value: webhookURL},
 							{Name: "method", Value: "1"}, // 1 = POST
@@ -266,8 +264,6 @@ func (m *Manager) EnsureWebhookRegistration(ctx context.Context, altmountURL str
 					OnUpgrade:          true,
 					OnRename:           true,
 					OnTrackRetag:       true,
-					OnAlbumDelete:      true,
-					OnArtistDelete:     true,
 					Fields: []*starr.FieldInput{
 						{Name: "url", Value: webhookURL},
 						{Name: "method", Value: "1"}, // 1 = POST
